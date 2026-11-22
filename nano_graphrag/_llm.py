@@ -15,10 +15,12 @@ import os
 
 from ._utils import compute_args_hash, wrap_embedding_func_with_attrs
 from .base import BaseKVStorage
+from ._config import get_settings
 
 global_openai_async_client = None
 global_azure_openai_async_client = None
 global_amazon_bedrock_async_client = None
+global_deepseek_async_client = None
 
 
 def get_openai_async_client_instance():
@@ -42,20 +44,30 @@ def get_amazon_bedrock_async_client_instance():
     return global_amazon_bedrock_async_client
 
 
+def get_deepseek_async_client_instance():
+    global global_deepseek_async_client
+    if global_deepseek_async_client is None:
+        settings = get_settings()
+        global_deepseek_async_client = AsyncOpenAI(
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+        )
+    return global_deepseek_async_client
+
+
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     retry=retry_if_exception_type((RateLimitError, APIConnectionError)),
 )
-async def openai_complete_if_cache(
-    model, prompt, system_prompt=None, history_messages=[], **kwargs
+async def openai_compatible_complete_if_cache(
+    client, model, prompt, system_prompt=None, history_messages=None, **kwargs
 ) -> str:
-    openai_async_client = get_openai_async_client_instance()
     hashing_kv: BaseKVStorage = kwargs.pop("hashing_kv", None)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    messages.extend(history_messages)
+    messages.extend(history_messages or [])
     messages.append({"role": "user", "content": prompt})
     if hashing_kv is not None:
         args_hash = compute_args_hash(model, messages)
@@ -63,7 +75,7 @@ async def openai_complete_if_cache(
         if if_cache_return is not None:
             return if_cache_return["return"]
 
-    response = await openai_async_client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model, messages=messages, **kwargs
     )
 
@@ -73,6 +85,63 @@ async def openai_complete_if_cache(
         )
         await hashing_kv.index_done_callback()
     return response.choices[0].message.content
+
+
+async def openai_complete_if_cache(
+    model, prompt, system_prompt=None, history_messages=None, **kwargs
+) -> str:
+    return await openai_compatible_complete_if_cache(
+        get_openai_async_client_instance(),
+        model,
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        **kwargs,
+    )
+
+
+async def deepseek_complete_if_cache(
+    model, prompt, system_prompt=None, history_messages=None, **kwargs
+) -> str:
+    settings = get_settings()
+    extra_body = dict(kwargs.pop("extra_body", {}) or {})
+    extra_body.setdefault("thinking", {"type": settings.deepseek_thinking})
+
+    return await openai_compatible_complete_if_cache(
+        get_deepseek_async_client_instance(),
+        model,
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        extra_body=extra_body,
+        **kwargs,
+    )
+
+
+async def deepseek_best_complete(
+    prompt, system_prompt=None, history_messages=None, **kwargs
+) -> str:
+    settings = get_settings()
+    return await deepseek_complete_if_cache(
+        settings.deepseek_best_model,
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        **kwargs,
+    )
+
+
+async def deepseek_cheap_complete(
+    prompt, system_prompt=None, history_messages=None, **kwargs
+) -> str:
+    settings = get_settings()
+    return await deepseek_complete_if_cache(
+        settings.deepseek_cheap_model,
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        **kwargs,
+    )
 
 
 @retry(

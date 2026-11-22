@@ -10,13 +10,13 @@ from typing import Callable, Dict, List, Optional, Type, Union, cast
 from ._llm import (
     amazon_bedrock_embedding,
     create_amazon_bedrock_complete_function,
-    gpt_4o_complete,
-    gpt_4o_mini_complete,
-    openai_embedding,
+    deepseek_best_complete,
+    deepseek_cheap_complete,
     azure_gpt_4o_complete,
     azure_openai_embedding,
     azure_gpt_4o_mini_complete,
 )
+from ._embedding import bge_m3_embedding
 from ._op import (
     chunking_by_token_size,
     extract_entities,
@@ -105,9 +105,11 @@ class GraphRAG:
     )
 
     # text embedding
-    embedding_func: EmbeddingFunc = field(default_factory=lambda: openai_embedding)
-    embedding_batch_num: int = 32
-    embedding_func_max_async: int = 16
+    embedding_func: EmbeddingFunc = field(
+        default_factory=lambda: bge_m3_embedding
+    )
+    embedding_batch_num: int = 16
+    embedding_func_max_async: int = 1
     query_better_than_threshold: float = 0.2
 
     # LLM
@@ -115,10 +117,10 @@ class GraphRAG:
     using_amazon_bedrock: bool = False
     best_model_id: str = "us.anthropic.claude-3-sonnet-20240229-v1:0"
     cheap_model_id: str = "us.anthropic.claude-3-haiku-20240307-v1:0"
-    best_model_func: callable = gpt_4o_complete
+    best_model_func: callable = deepseek_best_complete
     best_model_max_token_size: int = 32768
     best_model_max_async: int = 16
-    cheap_model_func: callable = gpt_4o_mini_complete
+    cheap_model_func: callable = deepseek_cheap_complete
     cheap_model_max_token_size: int = 32768
     cheap_model_max_async: int = 16
 
@@ -147,16 +149,10 @@ class GraphRAG:
         )
 
         if self.using_azure_openai:
-            # If there's no OpenAI API key, use Azure OpenAI
-            if self.best_model_func == gpt_4o_complete:
-                self.best_model_func = azure_gpt_4o_complete
-            if self.cheap_model_func == gpt_4o_mini_complete:
-                self.cheap_model_func = azure_gpt_4o_mini_complete
-            if self.embedding_func == openai_embedding:
-                self.embedding_func = azure_openai_embedding
-            logger.info(
-                "Switched the default openai funcs to Azure OpenAI if you didn't set any of it"
-            )
+            self.best_model_func = azure_gpt_4o_complete
+            self.cheap_model_func = azure_gpt_4o_mini_complete
+            self.embedding_func = azure_openai_embedding
+            logger.info("Switched model funcs to Azure OpenAI")
 
         if self.using_amazon_bedrock:
             self.best_model_func = create_amazon_bedrock_complete_function(self.best_model_id)
@@ -279,7 +275,7 @@ class GraphRAG:
         try:
             if isinstance(string_or_strings, str):
                 string_or_strings = [string_or_strings]
-            # ---------- new docs
+            # ---------- new docs 生成文档 ID
             new_docs = {
                 compute_mdhash_id(c.strip(), prefix="doc-"): {"content": c.strip()}
                 for c in string_or_strings
@@ -291,7 +287,7 @@ class GraphRAG:
                 return
             logger.info(f"[New Docs] inserting {len(new_docs)} docs")
 
-            # ---------- chunking
+            # ---------- chunking Token级分块、构建chunk向量库
 
             inserting_chunks = get_chunks(
                 new_docs=new_docs,
@@ -318,7 +314,7 @@ class GraphRAG:
             # TODO: don't support incremental update for communities now, so we have to drop all
             await self.community_reports.drop()
 
-            # ---------- extract/summary entity and upsert to graph
+            # ---------- extract/summary entity and upsert to graph 实体和关系抽取（合并节点和边）
             logger.info("[Entity Extraction]...")
             maybe_new_kg = await self.entity_extraction_func(
                 inserting_chunks,
@@ -332,7 +328,8 @@ class GraphRAG:
                 logger.warning("No new entities found")
                 return
             self.chunk_entity_relation_graph = maybe_new_kg
-            # ---------- update clusterings of graph
+
+            # ---------- update clusterings of graph 社区聚类与生成社区摘要
             logger.info("[Community Report]...")
             await self.chunk_entity_relation_graph.clustering(
                 self.graph_cluster_algorithm
